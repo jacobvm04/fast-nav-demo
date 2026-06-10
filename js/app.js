@@ -33,6 +33,15 @@ const state = {
   stepMs: 0,
   ripple: 0,           // success animation clock (s)
   obsBuf: null,
+  tool: 'nav',         // nav | wall | erase
+  brushR: 0.3,         // meters
+  hover: null,         // [wx, wy] for brush preview
+  painting: false,
+  lastPaint: null,
+  occBase: null,       // pristine occupancy for "reset map"
+  rebuildMs: 10,       // EMA of derived-state rebuild cost
+  lastRebuild: 0,
+  sealed: false,
 };
 
 // ---------------------------------------------------------------- scene load
@@ -129,6 +138,10 @@ async function setScene(name) {
   const sim = new Sim(occ, meta.h, meta.w, meta.cell, meta.origin, state.manifest.sim);
   sim.setNoise(state.manifest.noise_stack, state.noiseLevel);
   state.sim = sim;
+  state.occBase = occ.slice();
+  state.sealed = false;
+  state.painting = false;
+  state.hover = null;
   Object.assign(state, labelComponents(sim));
   state.mapCanvas = renderMapBitmap(sim);
   const spawn = randomSpawn();
@@ -145,24 +158,177 @@ async function setScene(name) {
   $('s-val').textContent = '–';
 }
 
+// --------------------------------------------------------- obstacle brushes
+
+// Paint a disk of occupancy. Wall mode protects the robot and the goal point;
+// erase mode preserves a 2-cell solid ring at the grid border (the EDF sampler
+// clamps at the edges, so a breached border would read as open world).
+function paintDisk(wx, wy, add) {
+  const { sim } = state;
+  const rc = state.brushR / sim.cell;
+  const gx = (wx - sim.ox) / sim.cell;
+  const gy = (wy - sim.oy) / sim.cell;
+  const x0 = Math.max(add ? 0 : 2, Math.floor(gx - rc));
+  const x1 = Math.min(add ? sim.w - 1 : sim.w - 3, Math.ceil(gx + rc));
+  const y0 = Math.max(add ? 0 : 2, Math.floor(gy - rc));
+  const y1 = Math.min(add ? sim.h - 1 : sim.h - 3, Math.ceil(gy + rc));
+  const protect = add ? [
+    [sim.pos[0], sim.pos[1], sim.cfg.robot_radius + 0.08],
+    ...(state.mode === 'running' ? [[sim.goal[0], sim.goal[1], sim.cfg.goal_radius]] : []),
+  ] : [];
+  const v = add ? 1 : 0;
+  let changed = false;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      if ((x - gx) ** 2 + (y - gy) ** 2 > rc * rc) continue;
+      const cwx = sim.ox + x * sim.cell;
+      const cwy = sim.oy + y * sim.cell;
+      if (protect.some(([px, py, pr]) => (cwx - px) ** 2 + (cwy - py) ** 2 < pr * pr)) continue;
+      const i = y * sim.w + x;
+      if (sim.occ[i] !== v) { sim.occ[i] = v; changed = true; }
+    }
+  }
+  if (changed) {
+    // instant visual feedback on the map bitmap; full rebuild restores shading
+    const mctx = state.mapCanvas.getContext('2d');
+    mctx.fillStyle = add ? 'rgb(56,65,94)' : 'rgb(14,18,30)';
+    mctx.beginPath();
+    mctx.arc(gx, gy, rc, 0, 7);
+    mctx.fill();
+  }
+  return changed;
+}
+
+function paintSegment(from, to, add) {
+  const stepLen = Math.max(state.brushR * 0.5, state.sim.cell);
+  const d = Math.hypot(to[0] - from[0], to[1] - from[1]);
+  const n = Math.max(1, Math.ceil(d / stepLen));
+  let changed = false;
+  for (let i = 1; i <= n; i++) {
+    changed = paintDisk(from[0] + ((to[0] - from[0]) * i) / n,
+      from[1] + ((to[1] - from[1]) * i) / n, add) || changed;
+  }
+  return changed;
+}
+
+// If an erase stroke removed the floor assumptions the robot relied on (or a
+// fast drag painted over it), push it back to free space along the EDF gradient.
+function unstickRobot() {
+  const { sim } = state;
+  let [x, y] = sim.pos;
+  let d = sim.edfAt(x, y);
+  for (let i = 0; i < 50 && d < sim.cfg.robot_radius; i++) {
+    const h = sim.cell;
+    const dx = sim.edfAt(x + h, y) - sim.edfAt(x - h, y);
+    const dy = sim.edfAt(x, y + h) - sim.edfAt(x, y - h);
+    const gl = Math.hypot(dx, dy);
+    if (gl < 1e-9) break;
+    const push = (sim.cfg.robot_radius - d) + 0.5 * sim.cell;
+    x += (dx / gl) * push;
+    y += (dy / gl) * push;
+    d = sim.edfAt(x, y);
+  }
+  if (d < sim.cfg.robot_radius) {
+    const spawn = randomSpawn();
+    sim.setState(spawn, spawn);
+    state.prevPos = [...spawn];
+    state.trail = [];
+    state.mode = 'idle';
+    state.policy.reset();
+    setStatus('robot was buried — respawned. click to set a goal', 'warn');
+  } else {
+    // shift belief by the same amount so painting doesn't fake odometry info
+    sim.odom[0] += x - sim.pos[0];
+    sim.odom[1] += y - sim.pos[1];
+    sim.pos = [x, y];
+  }
+}
+
+// Recompute everything derived from occupancy: EDF, reachability, map colors.
+function rebuildDerived() {
+  const { sim } = state;
+  const t0 = performance.now();
+  sim.rebuildEDF();
+  Object.assign(state, labelComponents(sim));
+  state.mapCanvas = renderMapBitmap(sim);
+  unstickRobot();
+  sim.updateLidar();
+  if (state.mode === 'running') {
+    const sealed = compAt(sim.goal[0], sim.goal[1]) !== compAt(sim.pos[0], sim.pos[1]);
+    if (sealed && !state.sealed) setStatus('goal sealed off — the robot can’t reach it now', 'warn');
+    if (!sealed && state.sealed) setStatus('path reopened — navigating…');
+    state.sealed = sealed;
+  }
+  state.rebuildMs = 0.5 * state.rebuildMs + 0.5 * (performance.now() - t0);
+  state.lastRebuild = performance.now();
+}
+
 // ------------------------------------------------------------------- view
 
-function fitView() {
+// preserve=true keeps the user's zoom level and view center across resizes
+// (mobile browsers fire resize constantly as the address bar collapses).
+function fitView(preserve = false) {
   const { sim } = state;
   if (!sim) return;
   const dpr = devicePixelRatio || 1;
+  const old = { w: canvas.width, h: canvas.height, ...state.view, fitS: state.fitS };
   const cw = canvas.clientWidth * dpr;
   const ch = canvas.clientHeight * dpr;
   canvas.width = cw;
   canvas.height = ch;
   const wm = sim.w * sim.cell;
   const hm = sim.h * sim.cell;
-  const s = Math.min(cw / wm, ch / hm) * 0.94;
-  state.view = {
-    s,
-    x0: (cw - wm * s) / 2 - (sim.ox - sim.cell / 2) * s,
-    y0: (ch - hm * s) / 2 - (sim.oy - sim.cell / 2) * s,
-  };
+  const fitS = Math.min(cw / wm, ch / hm) * 0.94;
+  state.fitS = fitS;
+  if (preserve && old.fitS && old.w) {
+    const z = old.s / old.fitS;
+    const wcx = (old.w / 2 - old.x0) / old.s; // world point at old view center
+    const wcy = (old.h / 2 - old.y0) / old.s;
+    const s = fitS * z;
+    state.view = { s, x0: cw / 2 - wcx * s, y0: ch / 2 - wcy * s };
+    clampView();
+  } else {
+    state.view = {
+      s: fitS,
+      x0: (cw - wm * fitS) / 2 - (sim.ox - sim.cell / 2) * fitS,
+      y0: (ch - hm * fitS) / 2 - (sim.oy - sim.cell / 2) * fitS,
+    };
+  }
+}
+
+// keep at least a fifth of the viewport covered by the scene in each axis
+function clampView() {
+  const { sim, view } = state;
+  if (!sim) return;
+  const left = sim.ox - sim.cell / 2;
+  const top = sim.oy - sim.cell / 2;
+  const sl = view.x0 + left * view.s;
+  const sr = sl + sim.w * sim.cell * view.s;
+  if (sr < canvas.width * 0.2) view.x0 += canvas.width * 0.2 - sr;
+  else if (sl > canvas.width * 0.8) view.x0 -= sl - canvas.width * 0.8;
+  const st = view.y0 + top * view.s;
+  const sb = st + sim.h * sim.cell * view.s;
+  if (sb < canvas.height * 0.2) view.y0 += canvas.height * 0.2 - sb;
+  else if (st > canvas.height * 0.8) view.y0 -= st - canvas.height * 0.8;
+}
+
+function panBy(dxCss, dyCss) {
+  const dpr = devicePixelRatio || 1;
+  state.view.x0 += dxCss * dpr;
+  state.view.y0 += dyCss * dpr;
+  clampView();
+}
+
+// zoom by `factor` keeping the canvas point (cxCss, cyCss) fixed
+function applyZoom(factor, cxCss, cyCss) {
+  const v = state.view;
+  const dpr = devicePixelRatio || 1;
+  const s = Math.min(Math.max(v.s * factor, state.fitS * 0.8), state.fitS * 14);
+  factor = s / v.s;
+  v.x0 = cxCss * dpr - (cxCss * dpr - v.x0) * factor;
+  v.y0 = cyCss * dpr - (cyCss * dpr - v.y0) * factor;
+  v.s = s;
+  clampView();
 }
 
 const W2S = (x, y) => [state.view.x0 + x * state.view.s, state.view.y0 + y * state.view.s];
@@ -359,6 +525,125 @@ function draw(now) {
     ctx.arc(prx, pry, rr * 2.2 * pulse, 0, 7);
     ctx.stroke();
   }
+
+  // brush preview
+  if ((state.tool === 'wall' || state.tool === 'erase') && state.hover) {
+    const [hx, hy] = W2S(state.hover[0], state.hover[1]);
+    ctx.strokeStyle = state.tool === 'wall' ? 'rgba(255, 209, 102, 0.8)' : 'rgba(255, 107, 107, 0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.arc(hx, hy, state.brushR * s, 0, 7);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  drawScan();
+}
+
+// ------------------------------------------------------- robot's-eye panel
+
+const scanCanvas = $('scan');
+const sctx = scanCanvas.getContext('2d');
+
+function arrow(c, x0, y0, x1, y1, color, width) {
+  const a = Math.atan2(y1 - y0, x1 - x0);
+  const hl = Math.max(5, width * 2.5);
+  c.strokeStyle = color;
+  c.fillStyle = color;
+  c.lineWidth = width;
+  c.beginPath();
+  c.moveTo(x0, y0);
+  c.lineTo(x1, y1);
+  c.stroke();
+  c.beginPath();
+  c.moveTo(x1, y1);
+  c.lineTo(x1 - hl * Math.cos(a - 0.45), y1 - hl * Math.sin(a - 0.45));
+  c.lineTo(x1 - hl * Math.cos(a + 0.45), y1 - hl * Math.sin(a + 0.45));
+  c.closePath();
+  c.fill();
+}
+
+// The policy input, drawn geometrically in the believed frame: ray r sits at
+// its indexed angle 2πr/R (heading error is invisible to the robot), the goal
+// arrow is goal − odom. Orientation matches the map for easy comparison.
+function drawScan() {
+  const { sim, policy } = state;
+  if (!sim) return;
+  const dpr = devicePixelRatio || 1;
+  const cw = Math.round(scanCanvas.clientWidth * dpr);
+  const ch = Math.round(scanCanvas.clientHeight * dpr);
+  if (scanCanvas.width !== cw || scanCanvas.height !== ch) {
+    scanCanvas.width = cw;
+    scanCanvas.height = ch;
+  }
+  sctx.clearRect(0, 0, cw, ch);
+  const cx = cw / 2;
+  const cy = ch / 2;
+  const rad = Math.min(cx, cy) - 6 * dpr;
+  const s = rad / sim.cfg.max_range;
+  const R = sim.cfg.n_rays;
+
+  // range rings every 2 m
+  sctx.strokeStyle = 'rgba(107, 119, 153, 0.25)';
+  sctx.lineWidth = 1;
+  for (let m = 2; m <= sim.cfg.max_range; m += 2) {
+    sctx.beginPath();
+    sctx.arc(cx, cy, m * s, 0, 7);
+    sctx.stroke();
+  }
+
+  // scan polygon + return dots
+  sctx.beginPath();
+  for (let r = 0; r < R; r++) {
+    const th = (2 * Math.PI * r) / R;
+    const x = cx + Math.cos(th) * sim.lidar[r] * s;
+    const y = cy + Math.sin(th) * sim.lidar[r] * s;
+    if (r === 0) sctx.moveTo(x, y);
+    else sctx.lineTo(x, y);
+  }
+  sctx.closePath();
+  sctx.fillStyle = 'rgba(76, 201, 240, 0.10)';
+  sctx.fill();
+  sctx.strokeStyle = 'rgba(76, 201, 240, 0.45)';
+  sctx.lineWidth = 1;
+  sctx.stroke();
+  sctx.fillStyle = 'rgba(76, 201, 240, 0.85)';
+  for (let r = 0; r < R; r++) {
+    if (sim.lidar[r] >= sim.cfg.max_range - 1e-3) continue; // no return
+    const th = (2 * Math.PI * r) / R;
+    const x = cx + Math.cos(th) * sim.lidar[r] * s;
+    const y = cy + Math.sin(th) * sim.lidar[r] * s;
+    sctx.fillRect(x - dpr, y - dpr, 2 * dpr, 2 * dpr);
+  }
+
+  // believed goal vector (clipped to panel), with distance readout
+  const gx = sim.goal[0] - sim.odom[0];
+  const gy = sim.goal[1] - sim.odom[1];
+  const gd = Math.hypot(gx, gy);
+  if (state.mode !== 'idle' && gd > 1e-6) {
+    const cl = Math.min(gd, sim.cfg.max_range) * s;
+    arrow(sctx, cx, cy, cx + (gx / gd) * cl, cy + (gy / gd) * cl, '#ffd166', 1.5 * dpr);
+    sctx.fillStyle = '#ffd166';
+    sctx.font = `${10 * dpr}px ui-monospace, monospace`;
+    const tx = cx + (gx / gd) * cl * 0.72;
+    const ty = cy + (gy / gd) * cl * 0.72;
+    sctx.fillText(`${gd.toFixed(1)}m`, tx + 4 * dpr, ty - 4 * dpr);
+  }
+
+  // previous executed action (part of the input), scaled to half-radius at v_max
+  const [ax, ay] = policy.prev;
+  const an = Math.hypot(ax, ay);
+  if (an > 0.02) {
+    const as = (an / sim.cfg.v_max) * rad * 0.5;
+    arrow(sctx, cx, cy, cx + (ax / an) * as, cy + (ay / an) * as, '#4cc9f0', 2 * dpr);
+  }
+
+  // robot
+  sctx.fillStyle = '#aee8fa';
+  sctx.beginPath();
+  sctx.arc(cx, cy, 2.5 * dpr, 0, 7);
+  sctx.fill();
 }
 
 // ------------------------------------------------------------------ UI
@@ -379,17 +664,118 @@ function updateScore() {
   $('s-succ').textContent = `${state.succ}/${state.tries}`;
 }
 
-function onClick(ev) {
-  const { sim } = state;
-  if (!sim) return;
+function eventWorld(ev) {
   const rect = canvas.getBoundingClientRect();
-  const [wx, wy] = S2W(ev.clientX - rect.left, ev.clientY - rect.top);
+  return S2W(ev.clientX - rect.left, ev.clientY - rect.top);
+}
+
+// Gestures: tap = act (goal / teleport), one-finger drag = pan (nav/move) or
+// paint (brushes), two fingers = pinch zoom + pan, wheel = zoom.
+const pointers = new Map(); // pointerId -> [clientX, clientY]
+let tapStart = null;        // {x, y, shift, lastX, lastY}
+let panning = false;
+let pinchPrev = null;       // {d, cx, cy}
+
+function pinchState() {
+  const [a, b] = [...pointers.values()];
+  return { d: Math.hypot(a[0] - b[0], a[1] - b[1]), cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2 };
+}
+
+function endStroke() {
+  if (!state.painting) return;
+  state.painting = false;
+  state.lastPaint = null;
+  rebuildDerived();
+}
+
+function onPointerDown(ev) {
+  if (!state.sim) return;
+  try { canvas.setPointerCapture(ev.pointerId); } catch { /* synthetic events */ }
+  pointers.set(ev.pointerId, [ev.clientX, ev.clientY]);
+  if (pointers.size === 2) {
+    endStroke();          // second finger: whatever was happening becomes a pinch
+    tapStart = null;
+    panning = false;
+    pinchPrev = pinchState();
+    return;
+  }
+  if (pointers.size > 2) return;
+  if ((state.tool === 'wall' || state.tool === 'erase') && !ev.shiftKey) {
+    const [wx, wy] = eventWorld(ev);
+    state.painting = true;
+    state.lastPaint = [wx, wy];
+    paintDisk(wx, wy, state.tool === 'wall');
+    return;
+  }
+  tapStart = { x: ev.clientX, y: ev.clientY, shift: ev.shiftKey, lastX: ev.clientX, lastY: ev.clientY };
+  panning = false;
+}
+
+function onPointerMove(ev) {
+  if (!state.sim) return;
+  state.hover = eventWorld(ev);
+  if (!pointers.has(ev.pointerId)) return;
+  pointers.set(ev.pointerId, [ev.clientX, ev.clientY]);
+
+  if (pointers.size === 2 && pinchPrev) {
+    const rect = canvas.getBoundingClientRect();
+    const cur = pinchState();
+    applyZoom(cur.d / Math.max(pinchPrev.d, 1e-6), cur.cx - rect.left, cur.cy - rect.top);
+    panBy(cur.cx - pinchPrev.cx, cur.cy - pinchPrev.cy);
+    pinchPrev = cur;
+    return;
+  }
+
+  if (state.painting) {
+    const [wx, wy] = eventWorld(ev);
+    paintSegment(state.lastPaint, [wx, wy], state.tool === 'wall');
+    state.lastPaint = [wx, wy];
+    // keep physics honest during long strokes without re-running EDT every event
+    if (performance.now() - state.lastRebuild > Math.max(120, 3 * state.rebuildMs)) {
+      rebuildDerived();
+    }
+    return;
+  }
+
+  if (tapStart) {
+    if (panning || Math.hypot(ev.clientX - tapStart.x, ev.clientY - tapStart.y) > 8) {
+      panning = true;
+      panBy(ev.clientX - tapStart.lastX, ev.clientY - tapStart.lastY);
+      tapStart.lastX = ev.clientX;
+      tapStart.lastY = ev.clientY;
+    }
+  }
+}
+
+function onPointerUp(ev) {
+  pointers.delete(ev.pointerId);
+  if (pointers.size < 2) pinchPrev = null;
+  if (pointers.size === 1) {
+    // pinch ended with one finger still down: treat the remainder as a pan
+    const [x, y] = [...pointers.values()][0];
+    tapStart = { x, y, shift: false, lastX: x, lastY: y };
+    panning = true;
+    return;
+  }
+  if (pointers.size > 0) return;
+  if (state.painting) {
+    endStroke();
+  } else if (tapStart && !panning) {
+    actOnTap(ev, tapStart.shift);
+  }
+  tapStart = null;
+  panning = false;
+}
+
+function actOnTap(ev, shift) {
+  const { sim } = state;
+  const [wx, wy] = eventWorld(ev);
   const c = compAt(wx, wy);
   const clear = sim.edfAt(wx, wy);
 
-  if (ev.shiftKey) {
-    if (c !== state.mainComp || clear < sim.cfg.robot_radius + 0.02) {
-      setStatus('cannot teleport there — blocked or unreachable', 'error');
+  if (shift || state.tool === 'move') {
+    if (c === -1 || clear < sim.cfg.robot_radius + 0.02) {
+      setStatus('cannot teleport there — blocked', 'error');
       return;
     }
     sim.setState([wx, wy], sim.pos);
@@ -397,12 +783,14 @@ function onClick(ev) {
     state.trail = [];
     state.policy.reset();
     state.mode = 'idle';
-    setStatus('robot moved — click to set a goal');
+    setStatus('robot moved — set a goal with navigate');
     return;
   }
+  if (state.tool !== 'nav') return;
 
-  if (c !== state.mainComp || clear < sim.cfg.robot_radius + 0.02) {
-    setStatus(c !== state.mainComp && c !== -1
+  const robotComp = compAt(sim.pos[0], sim.pos[1]);
+  if (c !== robotComp || clear < sim.cfg.robot_radius + 0.02) {
+    setStatus(c !== robotComp && c !== -1
       ? 'that spot is sealed off from the robot' : 'blocked — pick open floor', 'error');
     return;
   }
@@ -411,6 +799,7 @@ function onClick(ev) {
   state.policy.reset();   // new episode: hidden state + prev action reset
   state.acc = 0;
   state.mode = 'running';
+  state.sealed = false;
   state.tries++;
   updateScore();
   setStatus('navigating…');
@@ -480,8 +869,33 @@ async function main() {
       $('speed').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
     };
   }
-  canvas.addEventListener('pointerdown', onClick);
-  new ResizeObserver(fitView).observe($('stage'));
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('pointerleave', () => { state.hover = null; });
+  canvas.addEventListener('contextmenu', (ev) => ev.preventDefault()); // long-press
+  canvas.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    applyZoom(Math.exp(-ev.deltaY * 0.0015), ev.clientX - rect.left, ev.clientY - rect.top);
+  }, { passive: false });
+
+  for (const b of $('tool').querySelectorAll('button')) {
+    b.onclick = () => {
+      state.tool = b.dataset.t;
+      $('tool').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+    };
+  }
+  $('brush').oninput = () => { state.brushR = parseFloat($('brush').value); };
+  $('resetmap').onclick = () => {
+    if (!state.sim) return;
+    state.sim.occ.set(state.occBase);
+    rebuildDerived();
+    setStatus('scene restored');
+  };
+
+  new ResizeObserver(() => fitView(true)).observe($('stage'));
 
   window.fastnav = state; // debug/test hook
   $('loading').remove();
