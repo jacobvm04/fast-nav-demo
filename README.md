@@ -1,6 +1,6 @@
 # fast-nav · browser demo
 
-**Live demo: https://jacobvm04.github.io/fast-nav-demo/**
+**Live demo: https://fastnav.jacobvm.com/**
 
 Interactive point-navigation demo: pick a held-out indoor scene, click anywhere to set a
 goal, and watch a trained policy navigate there in real time. Everything — lidar
