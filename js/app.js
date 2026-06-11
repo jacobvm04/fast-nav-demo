@@ -136,7 +136,10 @@ async function setScene(name) {
   $('status').textContent = `loading ${meta.name}…`;
   const occ = await loadOccupancy(meta);
   const sim = new Sim(occ, meta.h, meta.w, meta.cell, meta.origin, state.manifest.sim);
-  if (state.policy) sim.setRays(state.policy.nRays);
+  if (state.policy) {
+    sim.setKinematics(state.policy.kinematics);
+    sim.setRays(state.policy.nRays);
+  }
   sim.setNoise(state.manifest.noise_stack, state.noiseLevel);
   state.sim = sim;
   state.occBase = occ.slice();
@@ -363,8 +366,12 @@ function physicsStep() {
   const act = policy.step(state.obsBuf);
   const { reached } = sim.step(act[0], act[1]);
   state.stepMs = 0.9 * state.stepMs + 0.1 * (performance.now() - t0);
-  const sp = Math.hypot(act[0], act[1]);
-  if (sp > 0.05) state.heading = [act[0] / sp, act[1] / sp];
+  if (sim.kin.bodyOriented) {
+    state.heading = [Math.cos(sim.heading), Math.sin(sim.heading)];
+  } else {
+    const sp = Math.hypot(act[0], act[1]);
+    if (sp > 0.05) state.heading = [act[0] / sp, act[1] / sp];
+  }
   state.trail.push([...sim.pos]);
   if (state.trail.length > 8192) state.trail.shift();
   $('s-steps').textContent = `${sim.stepCount}`;
@@ -422,8 +429,9 @@ function draw(now) {
   // lidar
   if (state.mode === 'running' || state.mode === 'success') {
     ctx.lineWidth = 1;
+    const frame = sim.sensorAngle();
     for (let r = 0; r < sim.cfg.n_rays; r++) {
-      const th = (2 * Math.PI * r) / sim.cfg.n_rays + sim.odom[2];
+      const th = (2 * Math.PI * r) / sim.cfg.n_rays + frame;
       const d = sim.lidar[r];
       const [hx, hy] = W2S(rx + Math.cos(th) * d, ry + Math.sin(th) * d);
       ctx.strokeStyle = 'rgba(76, 201, 240, 0.07)';
@@ -565,9 +573,10 @@ function arrow(c, x0, y0, x1, y1, color, width) {
   c.fill();
 }
 
-// The policy input, drawn geometrically in the believed frame: ray r sits at
-// its indexed angle 2πr/R (heading error is invisible to the robot), the goal
-// arrow is goal − odom. Orientation matches the map for easy comparison.
+// The policy input, drawn geometrically in the observation frame: ray r sits
+// at its indexed angle 2πr/R (heading error is invisible to the robot), the
+// goal arrow is the kinematics' rel_goal. For a holonomic policy this frame
+// matches the map; for a body-frame policy (diffdrive) +x is the robot's nose.
 function drawScan() {
   const { sim, policy } = state;
   if (!sim) return;
@@ -618,9 +627,8 @@ function drawScan() {
     sctx.fillRect(x - dpr, y - dpr, 2 * dpr, 2 * dpr);
   }
 
-  // believed goal vector (clipped to panel), with distance readout
-  const gx = sim.goal[0] - sim.odom[0];
-  const gy = sim.goal[1] - sim.odom[1];
+  // believed goal vector in the observation frame (clipped), distance readout
+  const [gx, gy] = sim.kin.relGoal(sim);
   const gd = Math.hypot(gx, gy);
   if (state.mode !== 'idle' && gd > 1e-6) {
     const cl = Math.min(gd, sim.cfg.max_range) * s;
@@ -632,12 +640,27 @@ function drawScan() {
     sctx.fillText(`${gd.toFixed(1)}m`, tx + 4 * dpr, ty - 4 * dpr);
   }
 
-  // previous executed action (part of the input), scaled to half-radius at v_max
-  const [ax, ay] = policy.prev;
-  const an = Math.hypot(ax, ay);
-  if (an > 0.02) {
-    const as = (an / sim.cfg.v_max) * rad * 0.5;
-    arrow(sctx, cx, cy, cx + (ax / an) * as, cy + (ay / an) * as, '#4cc9f0', 2 * dpr);
+  // previous executed action (part of the input), scaled to half-radius at the
+  // limit. Holonomic: world velocity. Diffdrive: forward speed along the nose
+  // (+x) plus a yaw-rate arc.
+  const [a0, a1] = policy.prev;
+  if (sim.kin.bodyOriented) {
+    const as = (a0 / policy.actScale[0]) * rad * 0.5;
+    if (Math.abs(as) > 1) arrow(sctx, cx, cy, cx + as, cy, '#4cc9f0', 2 * dpr);
+    const wf = a1 / policy.actScale[1];
+    if (Math.abs(wf) > 0.02) {
+      sctx.strokeStyle = '#4cc9f0';
+      sctx.lineWidth = 2 * dpr;
+      sctx.beginPath();
+      sctx.arc(cx, cy, rad * 0.22, 0, wf * Math.PI * 0.5, wf < 0);
+      sctx.stroke();
+    }
+  } else {
+    const an = Math.hypot(a0, a1);
+    if (an > 0.02) {
+      const as = (an / policy.actScale[0]) * rad * 0.5;
+      arrow(sctx, cx, cy, cx + (a0 / an) * as, cy + (a1 / an) * as, '#4cc9f0', 2 * dpr);
+    }
   }
 
   // robot
@@ -832,6 +855,7 @@ async function main() {
     state.policy.reset();
     state.obsBuf = new Float32Array(state.policy.obsDim);
     if (state.sim) {
+      state.sim.setKinematics(state.policy.kinematics);
       state.sim.setRays(state.policy.nRays);
       if (state.mode === 'running') state.sim.newEpisode(); // restart episode cleanly
     }
