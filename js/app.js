@@ -154,7 +154,7 @@ async function setScene(name) {
   state.policy.reset();
   fitView();
   const sizeM = `${(meta.w * meta.cell).toFixed(0)}×${(meta.h * meta.cell).toFixed(0)} m`;
-  setStatus(`${meta.name} (${meta.group}, ${sizeM}) — click anywhere to set a goal`);
+  setStatus(`${meta.name} (${meta.group}, ${sizeM}) · click to set a goal`);
   $('s-steps').textContent = '–';
   $('s-val').textContent = '–';
 }
@@ -236,7 +236,7 @@ function unstickRobot() {
     state.trail = [];
     state.mode = 'idle';
     state.policy.reset();
-    setStatus('robot was buried — respawned. click to set a goal', 'warn');
+    setStatus('robot walled in — respawned', 'warn');
   } else {
     // shift belief by the same amount so painting doesn't fake odometry info
     sim.odom[0] += x - sim.pos[0];
@@ -256,8 +256,8 @@ function rebuildDerived() {
   sim.updateLidar();
   if (state.mode === 'running') {
     const sealed = compAt(sim.goal[0], sim.goal[1]) !== compAt(sim.pos[0], sim.pos[1]);
-    if (sealed && !state.sealed) setStatus('goal sealed off — the robot can’t reach it now', 'warn');
-    if (!sealed && state.sealed) setStatus('path reopened — navigating…');
+    if (sealed && !state.sealed) setStatus('no path to goal', 'warn');
+    if (!sealed && state.sealed) setStatus('path reopened');
     state.sealed = sealed;
   }
   state.rebuildMs = 0.5 * state.rebuildMs + 0.5 * (performance.now() - t0);
@@ -370,16 +370,16 @@ function physicsStep() {
   $('s-steps').textContent = `${sim.stepCount}`;
   $('s-drift').textContent = state.noiseLevel > 0
     ? `${Math.hypot(sim.pos[0] - sim.odom[0], sim.pos[1] - sim.odom[1]).toFixed(2)} m` : '–';
-  $('s-val').textContent = `${criticToMeters(policy.value).toFixed(1)} m to go`;
+  $('s-val').textContent = `${criticToMeters(policy.value).toFixed(1)} m`;
   $('s-ms').textContent = `${state.stepMs.toFixed(2)} ms/step`;
   if (reached) {
     state.mode = 'success';
     state.ripple = 0;
     state.succ++;
-    setStatus(`goal reached in ${sim.stepCount} steps (${(sim.stepCount * sim.cfg.dt).toFixed(1)} s sim time) — click for a new goal`, 'success');
+    setStatus(`goal reached · ${sim.stepCount} steps, ${(sim.stepCount * sim.cfg.dt).toFixed(1)} s sim time`, 'success');
     updateScore();
   } else if (sim.stepCount === sim.cfg.max_steps) {
-    setStatus(`past the ${sim.cfg.max_steps}-step training horizon — still trying`, 'warn');
+    setStatus(`exceeded ${sim.cfg.max_steps}-step training horizon`, 'warn');
   }
 }
 
@@ -776,7 +776,7 @@ function actOnTap(ev, shift) {
 
   if (shift || state.tool === 'move') {
     if (c === -1 || clear < sim.cfg.robot_radius + 0.02) {
-      setStatus('cannot teleport there — blocked', 'error');
+      setStatus('teleport blocked', 'error');
       return;
     }
     sim.setState([wx, wy], sim.pos);
@@ -784,7 +784,7 @@ function actOnTap(ev, shift) {
     state.trail = [];
     state.policy.reset();
     state.mode = 'idle';
-    setStatus('robot moved — set a goal with navigate');
+    setStatus('robot moved');
     return;
   }
   if (state.tool !== 'nav') return;
@@ -792,7 +792,7 @@ function actOnTap(ev, shift) {
   const robotComp = compAt(sim.pos[0], sim.pos[1]);
   if (c !== robotComp || clear < sim.cfg.robot_radius + 0.02) {
     setStatus(c !== robotComp && c !== -1
-      ? 'that spot is sealed off from the robot' : 'blocked — pick open floor', 'error');
+      ? 'goal unreachable from robot position' : 'blocked', 'error');
     return;
   }
   sim.goal = [wx, wy];
@@ -866,7 +866,7 @@ async function main() {
   };
   $('pause').onclick = () => {
     state.paused = !state.paused;
-    $('pause').textContent = state.paused ? '▶ resume' : '⏸ pause';
+    $('pause').textContent = state.paused ? 'resume' : 'pause';
   };
   for (const b of $('speed').querySelectorAll('button')) {
     b.onclick = () => {
@@ -897,7 +897,7 @@ async function main() {
     if (!state.sim) return;
     state.sim.occ.set(state.occBase);
     rebuildDerived();
-    setStatus('scene restored');
+    setStatus('map reset');
   };
 
   new ResizeObserver(() => fitView(true)).observe($('stage'));
